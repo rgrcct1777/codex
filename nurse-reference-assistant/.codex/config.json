@@ -1,0 +1,10 @@
+{
+  "project": "Nurse Reference Assistant",
+  "defaultPlanFile": "PLANS.md",
+  "agentInstructionsFile": "AGENTS.md",
+  "notes": [
+    "Keep UI iPhone-first and uncluttered.",
+    "Never move API keys client-side.",
+    "Do not support PHI uploads."
+  ]
+}
