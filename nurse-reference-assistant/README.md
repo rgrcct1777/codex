@@ -50,6 +50,8 @@ cp .env.example .env
 
 Edit `.env` and add your real `OPENAI_API_KEY`.
 
+For iPhone + Expo Go, also set `EXPO_PUBLIC_API_BASE_URL` to your computer's LAN address (example: `http://192.168.1.10:4000`). `localhost` only works on the same device, so it will fail from a phone.
+
 ### 3) Start backend
 In terminal A:
 

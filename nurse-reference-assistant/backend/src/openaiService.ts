@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
+import path from "node:path";
 import OpenAI from "openai";
 import { z } from "zod";
 import type { QaResult, StoredDocument } from "./types.js";
@@ -16,6 +18,8 @@ const responseSchema = z.object({
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 let vectorStoreId: string | null = null;
+let hasLoadedPersistedVectorStoreId = false;
+const vectorStoreStatePath = path.resolve(process.cwd(), "data/vectorStore.json");
 
 export async function uploadToOpenAi(filename: string, filePath: string): Promise<string> {
   if (!process.env.OPENAI_API_KEY) {
@@ -52,10 +56,18 @@ export async function askFromDocuments(args: {
     "Keep shortAnswer concise and plain-English for a busy nurse.",
   ].join("\n");
 
+  const fileSearchFilter = buildFileSearchFilter(documents);
+
   const response = await client.responses.create({
     model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
     input: prompt,
-    tools: [{ type: "file_search", vector_store_ids: [storeId] }],
+    tools: [
+      {
+        type: "file_search",
+        vector_store_ids: [storeId],
+        ...(fileSearchFilter ? { filters: fileSearchFilter } : {}),
+      },
+    ],
   });
 
   const raw = response.output_text;
@@ -76,6 +88,8 @@ export async function askFromDocuments(args: {
 }
 
 async function ensureVectorStore(): Promise<string> {
+  await loadPersistedVectorStoreId();
+
   if (vectorStoreId) {
     return vectorStoreId;
   }
@@ -84,5 +98,43 @@ async function ensureVectorStore(): Promise<string> {
     name: "nurse-reference-assistant-private-store",
   });
   vectorStoreId = created.id;
+  await persistVectorStoreId(vectorStoreId);
   return vectorStoreId;
+}
+
+function buildFileSearchFilter(documents: StoredDocument[]) {
+  const filters = documents.map((doc) => ({
+    type: "eq" as const,
+    key: "file_id",
+    value: doc.openAiFileId,
+  }));
+
+  if (filters.length === 0) {
+    return null;
+  }
+
+  return filters.length === 1 ? filters[0] : { type: "or" as const, filters };
+}
+
+async function loadPersistedVectorStoreId(): Promise<void> {
+  if (hasLoadedPersistedVectorStoreId) {
+    return;
+  }
+
+  hasLoadedPersistedVectorStoreId = true;
+
+  try {
+    const raw = await fsp.readFile(vectorStoreStatePath, "utf8");
+    const parsed = JSON.parse(raw) as { vectorStoreId?: string };
+    if (parsed.vectorStoreId?.trim()) {
+      vectorStoreId = parsed.vectorStoreId;
+    }
+  } catch {
+    // No persisted vector store yet; a new one will be created on first use.
+  }
+}
+
+async function persistVectorStoreId(storeId: string): Promise<void> {
+  await fsp.mkdir(path.dirname(vectorStoreStatePath), { recursive: true });
+  await fsp.writeFile(vectorStoreStatePath, JSON.stringify({ vectorStoreId: storeId }, null, 2));
 }
