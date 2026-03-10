@@ -91,7 +91,14 @@ async function ensureVectorStore(): Promise<string> {
   await loadPersistedVectorStoreId();
 
   if (vectorStoreId) {
-    return vectorStoreId;
+    try {
+      await client.vectorStores.retrieve(vectorStoreId);
+      return vectorStoreId;
+    } catch {
+      // Persisted IDs can go stale if a store is deleted/expired or the API key changes.
+      // Reset and recreate so the service can recover automatically on next request.
+      vectorStoreId = null;
+    }
   }
 
   const created = await client.vectorStores.create({
