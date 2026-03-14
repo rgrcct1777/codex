@@ -3,6 +3,7 @@ import cors from "cors";
 import express from "express";
 import multer from "multer";
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { askFromDocuments, uploadToOpenAi } from "./openaiService.js";
 import { getDocuments, saveDocuments } from "./store.js";
@@ -30,23 +31,36 @@ app.get("/documents", async (_req, res) => {
 app.post("/documents/upload", upload.single("file"), async (req, res) => {
   const file = req.file;
 
-  if (!file || file.mimetype !== "application/pdf") {
-    res.status(400).json({ error: "Please upload a PDF." });
-    return;
+  try {
+    if (!file || file.mimetype !== "application/pdf") {
+      res.status(400).json({ error: "Please upload a PDF." });
+      return;
+    }
+
+    const openAiFileId = await uploadToOpenAi(file.originalname, file.path);
+    const documents = await getDocuments();
+
+    documents.push({
+      id: randomUUID(),
+      filename: file.originalname,
+      openAiFileId,
+      uploadedAt: new Date().toISOString(),
+    });
+
+    await saveDocuments(documents);
+    res.status(201).json({ ok: true });
+  } catch (error) {
+    console.error("Failed to upload document", error);
+    res.status(500).json({ error: "Failed to upload document." });
+  } finally {
+    if (file?.path) {
+      try {
+        await fs.unlink(file.path);
+      } catch (unlinkError) {
+        console.error("Failed to remove temporary upload", unlinkError);
+      }
+    }
   }
-
-  const openAiFileId = await uploadToOpenAi(file.originalname, file.path);
-  const documents = await getDocuments();
-
-  documents.push({
-    id: randomUUID(),
-    filename: file.originalname,
-    openAiFileId,
-    uploadedAt: new Date().toISOString(),
-  });
-
-  await saveDocuments(documents);
-  res.status(201).json({ ok: true });
 });
 
 app.post("/qa/ask", async (req, res) => {
