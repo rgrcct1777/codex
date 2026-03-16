@@ -2,21 +2,52 @@
 
 This project runs n8n locally with Docker Compose and stores your n8n data in a persistent Docker volume.
 
-## 1) Prerequisites (Mac)
+## 0) Put this folder on your Mac first
 
-1. Install **Docker Desktop for Mac** and open it.
-2. Wait until Docker Desktop shows it is running.
-3. Open the **Terminal** app.
+Your error happened because `~/Desktop/n8n-notion-local` does not exist yet.
 
-## 2) Create project files
+Pick one path:
 
-If you already have these files from Codex, skip to step 3.
+### Option A (recommended): copy this folder from Cursor project to your Desktop
+
+In Cursor terminal, run:
+
+```bash
+cd /path/to/your/project
+cp -R n8n-notion-local ~/Desktop/n8n-notion-local
+```
+
+### Option B: create the folder manually and add the three files
 
 ```bash
 cd ~/Desktop
 mkdir -p n8n-notion-local
 cd ~/Desktop/n8n-notion-local
 ```
+
+Then create:
+- `docker-compose.yml`
+- `.env.example`
+- `README.md`
+
+(Use the file contents in this project.)
+
+## 1) Prerequisites (Mac)
+
+1. Install **Docker Desktop for Mac** and open it.
+2. Wait until Docker Desktop shows it is running.
+3. Open the **Terminal** app.
+
+## 2) Verify files exist
+
+```bash
+cd ~/Desktop/n8n-notion-local
+ls -la
+```
+
+You should see at least:
+- `docker-compose.yml`
+- `.env.example`
 
 ## 3) Configure environment file
 
@@ -27,10 +58,11 @@ cp .env.example .env
 
 Now open `.env` and replace placeholder values:
 
-- `N8N_HOST=replace_me` → for local use, set `localhost`
-- `WEBHOOK_URL=replace_me` style values should match your final URL (for local use: `http://localhost:5678/`)
-- `NOTION_API_KEY=replace_me` (keep this as a placeholder in files; paste real key in n8n credentials UI)
-- `NOTION_DATABASE_ID=replace_me` (keep this as a placeholder in files; use real value in Notion node)
+- `N8N_HOST=replace_me` → set `localhost`
+- `N8N_EDITOR_BASE_URL=replace_me` → set `http://localhost:5678`
+- `WEBHOOK_URL=replace_me` → set `http://localhost:5678/`
+- `NOTION_API_KEY=replace_me` (keep placeholder in repo files; paste real key in n8n Credentials UI)
+- `NOTION_DATABASE_ID=replace_me` (keep placeholder in repo files; paste real value in Notion node)
 
 ## 4) Start n8n
 
