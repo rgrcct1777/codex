@@ -42,3 +42,40 @@ override), not "inherit the global default". There is currently no separate
 config value for "follow the global default in Plan mode".
 
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
+
+## Use Ollama as your local model provider
+
+If you want Codex to use your local Ollama server instead of cloud-hosted models:
+
+1. Start Ollama locally:
+
+   ```bash
+   ollama serve
+   ```
+
+2. In `~/.codex/config.toml`, set Ollama as the default OSS provider:
+
+   ```toml
+   oss_provider = "ollama"
+   ```
+
+3. Run Codex in local mode:
+
+   ```bash
+   codex --oss
+   ```
+
+You can also choose the provider per run:
+
+```bash
+codex --oss --local-provider ollama
+```
+
+If your Ollama server is not on the default URL (`http://localhost:11434/v1`), override the built-in provider in your config:
+
+```toml
+[model_providers.ollama]
+name = "Ollama"
+base_url = "http://your-host:11434/v1"
+wire_api = "responses"
+```
