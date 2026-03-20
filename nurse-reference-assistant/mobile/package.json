@@ -7,7 +7,8 @@
     "start": "expo start",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:snake": "node --test --experimental-strip-types src/snakeGame.test.mts"
   },
   "dependencies": {
     "expo": "~51.0.39",

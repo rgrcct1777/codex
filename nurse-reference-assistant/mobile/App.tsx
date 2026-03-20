@@ -1,10 +1,11 @@
 import { StatusBar } from "expo-status-bar";
 import * as DocumentPicker from "expo-document-picker";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -14,6 +15,13 @@ import {
   TextInput,
   View,
 } from "react-native";
+import {
+  type Direction,
+  createInitialSnakeGameState,
+  setSnakeDirection,
+  stepSnakeGame,
+  togglePaused,
+} from "./src/snakeGame";
 
 type UploadedDocument = {
   id: string;
@@ -42,6 +50,16 @@ const PRESETS = [
   "Shift cheat sheet",
 ] as const;
 
+const SNAKE_GRID = { width: 16, height: 16 } as const;
+const SNAKE_TICK_MS = 180;
+
+const DIRECTION_BUTTONS: Array<{ label: string; direction: Direction }> = [
+  { label: "↑", direction: "up" },
+  { label: "←", direction: "left" },
+  { label: "↓", direction: "down" },
+  { label: "→", direction: "right" },
+];
+
 /**
  * iPhone-first nurse study/reference app.
  * Keep this screen plain-English, high contrast, and low-clutter.
@@ -54,11 +72,70 @@ export default function App() {
   const [result, setResult] = useState<QaResult | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
+  const [snakeGame, setSnakeGame] = useState(() => createInitialSnakeGameState(SNAKE_GRID));
 
   const canAsk = useMemo(
     () => question.trim().length > 0 && (selectedIds.length > 0 || documents.length > 0),
     [question, selectedIds.length, documents.length],
   );
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setSnakeGame((current) => stepSnakeGame(current, SNAKE_GRID));
+    }, SNAKE_TICK_MS);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== "web") {
+      return;
+    }
+
+    const mapKeyToDirection: Record<string, Direction> = {
+      ArrowUp: "up",
+      ArrowDown: "down",
+      ArrowLeft: "left",
+      ArrowRight: "right",
+      w: "up",
+      W: "up",
+      s: "down",
+      S: "down",
+      a: "left",
+      A: "left",
+      d: "right",
+      D: "right",
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const direction = mapKeyToDirection[event.key];
+      if (direction) {
+        event.preventDefault();
+        setSnakeGame((current) => setSnakeDirection(current, direction));
+      }
+
+      if (event.key === " " || event.key === "p" || event.key === "P") {
+        event.preventDefault();
+        setSnakeGame((current) => togglePaused(current));
+      }
+
+      if (event.key === "r" || event.key === "R") {
+        event.preventDefault();
+        setSnakeGame(createInitialSnakeGameState(SNAKE_GRID));
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  function restartSnakeGame() {
+    setSnakeGame(createInitialSnakeGameState(SNAKE_GRID));
+  }
+
+  function onPressDirection(direction: Direction) {
+    setSnakeGame((current) => setSnakeDirection(current, direction));
+  }
 
   async function refreshDocuments() {
     const response = await fetch(`${API_BASE_URL}/documents`);
@@ -160,6 +237,77 @@ export default function App() {
       <ScrollView contentContainerStyle={styles.container}>
         <Text style={styles.title}>Nurse Reference Assistant</Text>
         <Text style={styles.subtitle}>Your private study and reference helper for nursing PDFs.</Text>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Classic Snake</Text>
+          <Text style={styles.smallPrint}>
+            Use arrow keys/WASD on web, or the direction pad below. Press Pause to stop the tick loop.
+          </Text>
+          <Text style={styles.gameMeta}>
+            Score: {snakeGame.score} · Length: {snakeGame.snake.length} ·{" "}
+            {snakeGame.didWin
+              ? "You win"
+              : snakeGame.isGameOver
+                ? "Game over"
+                : snakeGame.isPaused
+                  ? "Paused"
+                  : "Running"}
+          </Text>
+
+          <View style={styles.snakeGrid}>
+            {Array.from({ length: SNAKE_GRID.height }).map((_, rowIndex) => (
+              <View key={`row-${rowIndex}`} style={styles.snakeRow}>
+                {Array.from({ length: SNAKE_GRID.width }).map((__, columnIndex) => {
+                  const isHead =
+                    snakeGame.snake[0]?.x === columnIndex && snakeGame.snake[0]?.y === rowIndex;
+                  const isSnake = snakeGame.snake.some(
+                    (segment) => segment.x === columnIndex && segment.y === rowIndex,
+                  );
+                  const isFood =
+                    snakeGame.food.x === columnIndex && snakeGame.food.y === rowIndex;
+
+                  return (
+                    <View
+                      key={`cell-${rowIndex}-${columnIndex}`}
+                      style={[
+                        styles.snakeCell,
+                        isSnake && styles.snakeBodyCell,
+                        isHead && styles.snakeHeadCell,
+                        isFood && styles.snakeFoodCell,
+                      ]}
+                    />
+                  );
+                })}
+              </View>
+            ))}
+          </View>
+
+          <View style={styles.directionPad}>
+            {DIRECTION_BUTTONS.map((button) => (
+              <Pressable
+                key={button.label}
+                onPress={() => onPressDirection(button.direction)}
+                style={styles.directionButton}
+              >
+                <Text style={styles.directionButtonText}>{button.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+
+          <View style={styles.gameActionRow}>
+            <Pressable
+              style={styles.secondaryButton}
+              onPress={() => setSnakeGame((current) => togglePaused(current))}
+            >
+              <Text style={styles.secondaryButtonText}>
+                {snakeGame.isPaused ? "Resume" : "Pause"}
+              </Text>
+            </Pressable>
+            <Pressable style={styles.secondaryButton} onPress={restartSnakeGame}>
+              <Text style={styles.secondaryButtonText}>Restart</Text>
+            </Pressable>
+          </View>
+        </View>
 
         <View style={styles.banner}>
           <Text style={styles.bannerText}>
@@ -340,6 +488,44 @@ const styles = StyleSheet.create({
   docFilename: { fontSize: 15, fontWeight: "600", color: "#28343B" },
   docMeta: { fontSize: 13, color: "#60717A", marginTop: 2 },
   presetRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  gameMeta: { fontSize: 14, color: "#3E545D", fontWeight: "600" },
+  snakeGrid: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#C1D2D9",
+    overflow: "hidden",
+    alignSelf: "center",
+    backgroundColor: "#E6EEF1",
+  },
+  snakeRow: { flexDirection: "row" },
+  snakeCell: {
+    width: 14,
+    height: 14,
+    borderColor: "#D7E2E7",
+    borderWidth: 0.5,
+    backgroundColor: "#F8FBFC",
+  },
+  snakeBodyCell: { backgroundColor: "#79A8B8" },
+  snakeHeadCell: { backgroundColor: "#345B63" },
+  snakeFoodCell: { backgroundColor: "#D46245" },
+  directionPad: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  directionButton: {
+    width: 56,
+    height: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#9FB4BD",
+    backgroundColor: "#F3F8FA",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  directionButtonText: { fontSize: 24, fontWeight: "700", color: "#29424A" },
+  gameActionRow: { flexDirection: "row", gap: 10 },
   presetChip: {
     borderRadius: 18,
     borderWidth: 1,
