@@ -4,18 +4,25 @@ services:
     container_name: n8n
     restart: unless-stopped
     ports:
-      - "5678:5678"
+      - "${N8N_PORT:-5678}:5678"
     env_file:
       - .env
     environment:
       - TZ=${TZ}
       - N8N_HOST=${N8N_HOST}
-      - N8N_PORT=${N8N_PORT}
+      - N8N_PORT=5678
       - N8N_PROTOCOL=${N8N_PROTOCOL}
       - WEBHOOK_URL=${WEBHOOK_URL}
       - N8N_EDITOR_BASE_URL=${N8N_EDITOR_BASE_URL}
       - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
       - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE}
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     volumes:
       - n8n_data:/home/node/.n8n
 
