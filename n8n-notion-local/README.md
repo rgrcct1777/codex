@@ -1,160 +1,133 @@
-# Self-hosted n8n + Notion (macOS, beginner friendly)
+# Self-hosted n8n + Notion (macOS, beginner-friendly)
 
-This project runs n8n locally with Docker Compose and stores your n8n data in a persistent Docker volume.
+This folder provides a simple local Docker Compose setup for running n8n and connecting it to Notion.
 
-## 0) Put this folder on your Mac first
+## What this includes
 
-Your error happened because `~/Desktop/n8n-notion-local` does not exist yet.
+- `docker-compose.yml`: Runs n8n on `http://localhost:5678`
+- `.env.example`: Safe template of required environment variables
+- Persistent volume: `n8n_data` keeps workflows/credentials across restarts
 
-Pick one path:
+## 1) Prerequisites
 
-### Option A (recommended): copy this folder from Cursor project to your Desktop
-
-In Cursor terminal, run:
+1. Install **Docker Desktop for Mac**.
+2. Start Docker Desktop and wait until it shows **Running**.
+3. Open Terminal and move into this folder.
 
 ```bash
-cd /path/to/your/project
-cp -R n8n-notion-local ~/Desktop/n8n-notion-local
+cd /path/to/n8n-notion-local
 ```
 
-### Option B: create the folder manually and add the three files
+## 2) Create your `.env`
 
 ```bash
-cd ~/Desktop
-mkdir -p n8n-notion-local
-cd ~/Desktop/n8n-notion-local
-```
-
-Then create:
-- `docker-compose.yml`
-- `.env.example`
-- `README.md`
-
-(Use the file contents in this project.)
-
-## 1) Prerequisites (Mac)
-
-1. Install **Docker Desktop for Mac** and open it.
-2. Wait until Docker Desktop shows it is running.
-3. Open the **Terminal** app.
-
-## 2) Verify files exist
-
-```bash
-cd ~/Desktop/n8n-notion-local
-ls -la
-```
-
-You should see at least:
-- `docker-compose.yml`
-- `.env.example`
-
-## 3) Configure environment file
-
-```bash
-cd ~/Desktop/n8n-notion-local
 cp .env.example .env
 ```
 
-Now open `.env` and replace placeholder values:
+Open `.env` and confirm or update values:
 
-- `N8N_HOST=replace_me` → set `localhost`
-- `N8N_EDITOR_BASE_URL=replace_me` → set `http://localhost:5678`
-- `WEBHOOK_URL=replace_me` → set `http://localhost:5678/`
-- `NOTION_API_KEY=replace_me` (keep placeholder in repo files; paste real key in n8n Credentials UI)
-- `NOTION_DATABASE_ID=replace_me` (keep placeholder in repo files; paste real value in Notion node)
-
-## 4) Start n8n
+- Keep local URL values at localhost unless you know you need something else:
+  - `N8N_HOST=localhost`
+  - `N8N_EDITOR_BASE_URL=http://localhost:5678`
+  - `WEBHOOK_URL=http://localhost:5678/`
+- Set `N8N_ENCRYPTION_KEY` to a strong random value (important for encrypted credentials persistence):
 
 ```bash
-cd ~/Desktop/n8n-notion-local
+openssl rand -base64 32
+```
+
+Paste the generated value into `N8N_ENCRYPTION_KEY=...`.
+
+## 3) Start n8n
+
+```bash
 docker compose up -d
 ```
 
-Open n8n:
+Open n8n at:
 
 - `http://localhost:5678`
 
-On first launch, create your owner account in n8n.
+On first launch, create the owner account in the n8n UI.
 
-## 5) Stop / restart / update
+## 4) Connect Notion
+
+### A. Create a Notion integration
+
+1. Go to <https://www.notion.so/my-integrations>
+2. Click **New integration** and save it.
+3. Copy the **Internal Integration Secret**.
+4. Open your target Notion database and click **Share**.
+5. Invite the integration you created.
+6. Copy the database ID from the Notion database URL.
+
+### B. Add credentials in n8n
+
+1. In n8n: **Credentials** → **Add credential** → **Notion API**.
+2. Paste the Notion Internal Integration Secret.
+3. Save.
+
+### C. Build a quick smoke test workflow
+
+1. **Workflows** → **New Workflow**.
+2. Add **Manual Trigger**.
+3. Add a **Notion** node.
+4. Configure the Notion node to create a page in your target database.
+5. Execute the workflow and verify a new row/page appears in Notion.
+
+## 5) Common operations
+
+Start:
+
+```bash
+docker compose up -d
+```
 
 Stop:
 
 ```bash
-cd ~/Desktop/n8n-notion-local
 docker compose down
 ```
 
-Restart:
+Follow logs:
 
 ```bash
-cd ~/Desktop/n8n-notion-local
-docker compose up -d
+docker compose logs -f n8n
 ```
 
-Upgrade n8n later:
+Update to a newer n8n image:
 
 ```bash
-cd ~/Desktop/n8n-notion-local
 docker compose pull
 docker compose up -d
 ```
 
-## 6) Create Notion integration and share database
+## 6) Backup and restore notes
 
-1. Go to Notion integrations: `https://www.notion.so/my-integrations`
-2. Click **New integration**.
-3. Name it (example: `n8n-local`), choose your workspace, then save.
-4. Copy the **Internal Integration Secret** (this is your Notion API key).
-5. Open the target Notion database.
-6. Click **Share** → invite your integration (example: `n8n-local`).
-7. Copy your database ID from the database URL.
+n8n data is stored in Docker volume `n8n_data`.
 
-## 7) Build first workflow in n8n (manual trigger → Notion create page)
-
-### A. Add Notion credentials
-
-1. In n8n, click **Credentials**.
-2. Click **Add credential**.
-3. Choose **Notion API**.
-4. In API Key field, paste your real Notion integration secret.
-5. Save.
-
-### B. Create workflow
-
-1. Go to **Workflows** → **New Workflow**.
-2. Click **Add first step** → choose **Manual Trigger**.
-3. Click **+** after Manual Trigger → add **Notion** node.
-4. In Notion node:
-   - **Credential**: choose the Notion credential you created
-   - **Resource**: `Database Page` (or equivalent create-page option in your n8n version)
-   - **Operation**: `Create`
-   - **Database ID**: paste your `NOTION_DATABASE_ID`
-5. Map fields:
-   - Title field: `n8n Test Entry`
-   - Timestamp/date field: use expression `{{$now}}`
-6. Click **Execute workflow**.
-7. Confirm a new row/page appears in your Notion database.
-
-## 8) Single-user safety notes
-
-- This setup is intended for one trusted local user.
-- Keep `.env` private and do not commit real secrets.
-- Use HTTPS + reverse proxy before exposing n8n to the public internet.
-
-## 9) Troubleshooting
-
-Check logs:
+Inspect volume:
 
 ```bash
-cd ~/Desktop/n8n-notion-local
-docker compose logs -f n8n
+docker volume inspect n8n_data
 ```
 
-If port 5678 is busy, stop the other app using that port, then rerun:
+If you move machines, include a backup/restore plan for this volume so your workflows and credentials are preserved.
 
-```bash
-cd ~/Desktop/n8n-notion-local
-docker compose up -d
-```
+## 7) Security notes
+
+- Do **not** commit `.env` with real secrets.
+- Keep `N8N_SECURE_COOKIE=false` only for local HTTP usage.
+- If exposing n8n beyond localhost, put it behind HTTPS + reverse proxy first.
+
+## 8) Troubleshooting
+
+### Port 5678 already in use
+
+Stop the process using port `5678` or change the host-side port mapping in `docker-compose.yml`.
+
+### n8n starts but Notion calls fail
+
+- Re-check that the integration is invited to the database in Notion.
+- Confirm the token was copied correctly in n8n credentials.
+- Confirm the database ID is correct.
