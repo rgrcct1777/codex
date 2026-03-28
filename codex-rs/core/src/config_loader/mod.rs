@@ -6,12 +6,11 @@ mod macos;
 mod tests;
 
 use crate::config::ConfigToml;
-use crate::config::deserialize_config_toml_with_base;
 use crate::config_loader::layer_io::LoadedConfigLayers;
-use crate::git_info::resolve_root_git_project_for_trust;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigRequirementsWithSources;
+use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
@@ -25,6 +24,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
 
+pub use codex_config::AppRequirementToml;
+pub use codex_config::AppsRequirementsToml;
+pub use codex_config::CloudRequirementsLoadError;
+pub use codex_config::CloudRequirementsLoadErrorCode;
 pub use codex_config::CloudRequirementsLoader;
 pub use codex_config::ConfigError;
 pub use codex_config::ConfigLayerEntry;
@@ -34,11 +37,16 @@ pub use codex_config::ConfigLoadError;
 pub use codex_config::ConfigRequirements;
 pub use codex_config::ConfigRequirementsToml;
 pub use codex_config::ConstrainedWithSource;
+pub use codex_config::FeatureRequirementsToml;
 pub use codex_config::LoaderOverrides;
 pub use codex_config::McpServerIdentity;
 pub use codex_config::McpServerRequirement;
 pub use codex_config::NetworkConstraints;
+pub use codex_config::NetworkDomainPermissionToml;
+pub use codex_config::NetworkDomainPermissionsToml;
 pub use codex_config::NetworkRequirementsToml;
+pub use codex_config::NetworkUnixSocketPermissionToml;
+pub use codex_config::NetworkUnixSocketPermissionsToml;
 pub use codex_config::RequirementSource;
 pub use codex_config::ResidencyRequirement;
 pub use codex_config::SandboxModeRequirement;
@@ -48,10 +56,12 @@ pub use codex_config::TextRange;
 pub use codex_config::WebSearchModeRequirement;
 pub(crate) use codex_config::build_cli_overrides_layer;
 pub(crate) use codex_config::config_error_from_toml;
+pub use codex_config::default_project_root_markers;
 pub use codex_config::format_config_error;
 pub use codex_config::format_config_error_with_source;
 pub(crate) use codex_config::io_error_from_config_error;
 pub use codex_config::merge_toml_values;
+pub use codex_config::project_root_markers_from_config;
 #[cfg(test)]
 pub(crate) use codex_config::version_for_toml;
 
@@ -62,8 +72,6 @@ pub const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
 
 #[cfg(windows)]
 const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
-
-const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 
 pub(crate) async fn first_layer_config_error(layers: &ConfigLayerStack) -> Option<ConfigError> {
     codex_config::first_layer_config_error::<ConfigToml>(layers, CONFIG_TOML_FILE).await
@@ -116,7 +124,7 @@ pub async fn load_config_layers_state(
 ) -> io::Result<ConfigLayerStack> {
     let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
-    if let Some(requirements) = cloud_requirements.get().await {
+    if let Some(requirements) = cloud_requirements.get().await.map_err(io::Error::other)? {
         config_requirements_toml
             .merge_unset_fields(RequirementSource::CloudRequirements, requirements);
     }
@@ -205,7 +213,7 @@ pub async fn load_config_layers_state(
                     return Err(io_error_from_config_error(
                         io::ErrorKind::InvalidData,
                         config_error,
-                        None,
+                        /*source*/ None,
                     ));
                 }
                 return Err(err);
@@ -281,9 +289,16 @@ pub async fn load_config_layers_state(
         ));
     }
     if let Some(config) = managed_config_from_mdm {
+        // As a general rule, config from MDM should _not_ include relative
+        // paths, starting with `./`, but a path starting with `~/` _is_ a
+        // supported use case. Because resolve_relative_paths_in_config_toml()
+        // relies on AbsolutePathBufGuard to resolve `~/`, we must supply a
+        // value for base_dir, so codex_home is as good a value as any.
+        let managed_config =
+            resolve_relative_paths_in_config_toml(config.managed_config, codex_home)?;
         layers.push(ConfigLayerEntry::new_with_raw_toml(
             ConfigLayerSource::LegacyManagedConfigTomlFromMdm,
-            config.managed_config,
+            managed_config,
             config.raw_toml,
         ));
     }
@@ -518,61 +533,17 @@ async fn load_requirements_from_legacy_scheme(
     Ok(())
 }
 
-/// Reads `project_root_markers` from the [toml::Value] produced by merging
-/// `config.toml` from the config layers in the stack preceding
-/// [ConfigLayerSource::Project].
-///
-/// Invariants:
-/// - If `project_root_markers` is not specified, returns `Ok(None)`.
-/// - If `project_root_markers` is specified, returns `Ok(Some(markers))` where
-///   `markers` is a `Vec<String>` (including `Ok(Some(Vec::new()))` for an
-///   empty array, which indicates that root detection should be disabled).
-/// - Returns an error if `project_root_markers` is specified but is not an
-///   array of strings.
-pub(crate) fn project_root_markers_from_config(
-    config: &TomlValue,
-) -> io::Result<Option<Vec<String>>> {
-    let Some(table) = config.as_table() else {
-        return Ok(None);
-    };
-    let Some(markers_value) = table.get("project_root_markers") else {
-        return Ok(None);
-    };
-    let TomlValue::Array(entries) = markers_value else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "project_root_markers must be an array of strings",
-        ));
-    };
-    if entries.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let mut markers = Vec::new();
-    for entry in entries {
-        let Some(marker) = entry.as_str() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "project_root_markers must be an array of strings",
-            ));
-        };
-        markers.push(marker.to_string());
-    }
-    Ok(Some(markers))
-}
-
-pub(crate) fn default_project_root_markers() -> Vec<String> {
-    DEFAULT_PROJECT_ROOT_MARKERS
-        .iter()
-        .map(ToString::to_string)
-        .collect()
-}
-
 struct ProjectTrustContext {
     project_root: AbsolutePathBuf,
     project_root_key: String,
     repo_root_key: Option<String>,
     projects_trust: std::collections::HashMap<String, TrustLevel>,
     user_config_file: AbsolutePathBuf,
+}
+
+#[derive(Deserialize)]
+struct ProjectTrustConfigToml {
+    projects: Option<std::collections::HashMap<String, crate::config::ProjectConfig>>,
 }
 
 struct ProjectTrustDecision {
@@ -665,10 +636,16 @@ async fn project_trust_context(
     config_base_dir: &Path,
     user_config_file: &AbsolutePathBuf,
 ) -> io::Result<ProjectTrustContext> {
-    let config_toml = deserialize_config_toml_with_base(merged_config.clone(), config_base_dir)?;
+    let project_trust_config: ProjectTrustConfigToml = {
+        let _guard = AbsolutePathBufGuard::new(config_base_dir);
+        merged_config
+            .clone()
+            .try_into()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+    };
 
     let project_root = find_project_root(cwd, project_root_markers).await?;
-    let projects = config_toml.projects.unwrap_or_default();
+    let projects = project_trust_config.projects.unwrap_or_default();
 
     let project_root_key = project_root.as_path().to_string_lossy().to_string();
     let repo_root = resolve_root_git_project_for_trust(cwd.as_path());
@@ -838,15 +815,20 @@ async fn load_project_layers(
                             &dot_codex_abs,
                             &layer_dir,
                             TomlValue::Table(toml::map::Map::new()),
-                            true,
+                            /*config_toml_exists*/ true,
                         ));
                         continue;
                     }
                 };
                 let config =
                     resolve_relative_paths_in_config_toml(config, dot_codex_abs.as_path())?;
-                let entry =
-                    project_layer_entry(trust_context, &dot_codex_abs, &layer_dir, config, true);
+                let entry = project_layer_entry(
+                    trust_context,
+                    &dot_codex_abs,
+                    &layer_dir,
+                    config,
+                    /*config_toml_exists*/ true,
+                );
                 layers.push(entry);
             }
             Err(err) => {
@@ -859,7 +841,7 @@ async fn load_project_layers(
                         &dot_codex_abs,
                         &layer_dir,
                         TomlValue::Table(toml::map::Map::new()),
-                        false,
+                        /*config_toml_exists*/ false,
                     ));
                 } else {
                     let config_file_display = config_file.as_path().display();

@@ -203,7 +203,12 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 
     let body = serde_json::json!({ "echo": true });
     let _stream = client
-        .stream(body, HeaderMap::new(), Compression::None, None)
+        .stream(
+            body,
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
         .await?;
 
     let requests = state.take_stream_requests();
@@ -220,7 +225,12 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
 
     let body = serde_json::json!({ "model": "gpt-test" });
     let _stream = client
-        .stream(body, HeaderMap::new(), Compression::None, None)
+        .stream(
+            body,
+            HeaderMap::new(),
+            Compression::None,
+            /*turn_state*/ None,
+        )
         .await?;
 
     let requests = state.take_stream_requests();
@@ -265,6 +275,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         store: false,
         stream: true,
         include: Vec::new(),
+        service_tier: None,
         prompt_cache_key: None,
         text: None,
     };
@@ -306,6 +317,7 @@ async fn azure_default_store_attaches_ids_and_headers() -> Result<()> {
         store: true,
         stream: true,
         include: Vec::new(),
+        service_tier: None,
         prompt_cache_key: None,
         text: None,
     };

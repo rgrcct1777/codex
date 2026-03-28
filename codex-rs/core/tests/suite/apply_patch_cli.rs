@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use anyhow::Result;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use core_test_support::responses::ev_apply_patch_call;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_shell_command_call;
@@ -10,13 +12,14 @@ use std::fs;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
-use codex_core::features::Feature;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_features::Feature;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
+#[cfg(target_os = "linux")]
+use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
@@ -49,7 +52,9 @@ async fn apply_patch_harness_with(
     let builder = configure(test_codex()).with_config(|config| {
         config.include_apply_patch_tool = true;
     });
-    TestCodexHarness::with_builder(builder).await
+    // Box harness construction so apply_patch_cli tests do not inline the
+    // full test-thread startup path into each test future.
+    Box::pin(TestCodexHarness::with_builder(builder)).await
 }
 
 pub async fn mount_apply_patch(
@@ -83,6 +88,53 @@ fn apply_patch_responses(
             ev_completed("resp-2"),
         ]),
     ]
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_cli_uses_codex_self_exe_with_linux_sandbox_helper_alias() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    let codex_linux_sandbox_exe = harness
+        .test()
+        .config
+        .codex_linux_sandbox_exe
+        .as_ref()
+        .expect("linux test config should include codex-linux-sandbox helper");
+    assert_eq!(
+        codex_linux_sandbox_exe
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(CODEX_LINUX_SANDBOX_ARG0),
+    );
+
+    let patch = "*** Begin Patch\n*** Add File: helper-alias.txt\n+hello\n*** End Patch";
+    let call_id = "apply-helper-alias";
+    mount_apply_patch(
+        &harness,
+        call_id,
+        patch,
+        "done",
+        ApplyPatchModelOutput::Function,
+    )
+    .await;
+
+    harness.submit("please apply helper alias patch").await?;
+
+    let out = harness
+        .apply_patch_output(call_id, ApplyPatchModelOutput::Function)
+        .await;
+    assert_regex_match(
+        r"(?s)^Exit code: 0.*Success\. Updated the following files:\nA helper-alias\.txt\n?$",
+        &out,
+    );
+    assert_eq!(
+        fs::read_to_string(harness.path("helper-alias.txt"))?,
+        "hello\n"
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -308,10 +360,12 @@ async fn apply_patch_cli_move_without_content_change_has_no_turn_diff(
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -673,7 +727,10 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects(
 
     let harness = apply_patch_harness_with(|builder| {
         builder.with_config(|config| {
-            config.features.enable(Feature::ApplyPatchFreeform);
+            config
+                .features
+                .enable(Feature::ApplyPatchFreeform)
+                .expect("test config should allow feature update");
         })
     })
     .await?;
@@ -736,7 +793,9 @@ async fn apply_patch_shell_command_heredoc_with_cd_updates_relative_workdir() ->
 async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.1")).await?;
+    let harness =
+        apply_patch_harness_with(|builder| builder.with_model("gpt-5.1").with_windows_cmd_shell())
+            .await?;
 
     let source_contents = "line1\nnaïve café\nline3\n";
     let source_path = harness.path("source.txt");
@@ -782,9 +841,21 @@ async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result
             match call_num {
                 0 => {
                     let command = if cfg!(windows) {
-                        "Get-Content -Encoding utf8 source.txt"
+                        // Encode the nested PowerShell script so `cmd.exe /c` does not leave the
+                        // read command wrapped in quotes, and suppress progress records so the
+                        // shell tool only returns the file contents back to apply_patch.
+                        let script = "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [System.IO.File]::ReadAllText('source.txt', [System.Text.UTF8Encoding]::new($false))";
+                        let encoded = BASE64_STANDARD.encode(
+                            script
+                                .encode_utf16()
+                                .flat_map(u16::to_le_bytes)
+                                .collect::<Vec<u8>>(),
+                        );
+                        format!(
+                            "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}"
+                        )
                     } else {
-                        "cat source.txt"
+                        "cat source.txt".to_string()
                     };
                     let args = json!({
                         "command": command,
@@ -803,9 +874,7 @@ async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result
                     let body_json: serde_json::Value =
                         request.body_json().expect("request body should be json");
                     let read_output = function_call_output_text(&body_json, &self.read_call_id);
-                    eprintln!("read_output: \n{read_output}");
                     let stdout = stdout_from_shell_output(&read_output);
-                    eprintln!("stdout: \n{stdout}");
                     let patch_lines = stdout
                         .lines()
                         .map(|line| format!("+{line}"))
@@ -814,8 +883,6 @@ async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result
                     let patch = format!(
                         "*** Begin Patch\n*** Add File: target.txt\n{patch_lines}\n*** End Patch"
                     );
-
-                    eprintln!("patch: \n{patch}");
 
                     let body = sse(vec![
                         ev_response_created("resp-2"),
@@ -903,10 +970,12 @@ async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<(
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -983,10 +1052,12 @@ async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> 
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1133,10 +1204,12 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff(
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1196,10 +1269,12 @@ async fn apply_patch_turn_diff_for_rename_with_content_change(
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1267,10 +1342,12 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1338,10 +1415,12 @@ async fn apply_patch_aggregates_diff_preserves_success_after_failure() -> Result
             final_output_json_schema: None,
             cwd: cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })

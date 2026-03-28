@@ -1,19 +1,129 @@
 use crate::memories::memory_root;
 use crate::memories::phase_one;
-use crate::truncate::TruncationPolicy;
-use crate::truncate::truncate_text;
+use crate::memories::storage::rollout_summary_file_stem_from_parts;
 use codex_protocol::openai_models::ModelInfo;
+use codex_state::Phase2InputSelection;
+use codex_state::Stage1Output;
+use codex_state::Stage1OutputRef;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::truncate_text;
+use codex_utils_template::Template;
 use std::path::Path;
+use std::sync::LazyLock;
 use tokio::fs;
+use tracing::warn;
 
-const CONSOLIDATION_TEMPLATE: &str = include_str!("../../templates/memories/consolidation.md");
-const STAGE_ONE_INPUT_TEMPLATE: &str = include_str!("../../templates/memories/stage_one_input.md");
-const READ_PATH_TEMPLATE: &str = include_str!("../../templates/memories/read_path.md");
+static CONSOLIDATION_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_embedded_template(
+        include_str!("../../templates/memories/consolidation.md"),
+        "memories/consolidation.md",
+    )
+});
+static STAGE_ONE_INPUT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_embedded_template(
+        include_str!("../../templates/memories/stage_one_input.md"),
+        "memories/stage_one_input.md",
+    )
+});
+static MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_embedded_template(
+        include_str!("../../templates/memories/read_path.md"),
+        "memories/read_path.md",
+    )
+});
+
+fn parse_embedded_template(source: &'static str, template_name: &str) -> Template {
+    match Template::parse(source) {
+        Ok(template) => template,
+        Err(err) => panic!("embedded template {template_name} is invalid: {err}"),
+    }
+}
 
 /// Builds the consolidation subagent prompt for a specific memory root.
-pub(super) fn build_consolidation_prompt(memory_root: &Path) -> String {
+pub(super) fn build_consolidation_prompt(
+    memory_root: &Path,
+    selection: &Phase2InputSelection,
+) -> String {
     let memory_root = memory_root.display().to_string();
-    CONSOLIDATION_TEMPLATE.replace("{{ memory_root }}", &memory_root)
+    let phase2_input_selection = render_phase2_input_selection(selection);
+    CONSOLIDATION_PROMPT_TEMPLATE
+        .render([
+            ("memory_root", memory_root.as_str()),
+            ("phase2_input_selection", phase2_input_selection.as_str()),
+        ])
+        .unwrap_or_else(|err| {
+        warn!("failed to render memories consolidation prompt template: {err}");
+        format!(
+            "## Memory Phase 2 (Consolidation)\nConsolidate Codex memories in: {memory_root}\n\n{phase2_input_selection}"
+        )
+    })
+}
+
+fn render_phase2_input_selection(selection: &Phase2InputSelection) -> String {
+    let retained = selection.retained_thread_ids.len();
+    let added = selection.selected.len().saturating_sub(retained);
+    let selected = if selection.selected.is_empty() {
+        "- none".to_string()
+    } else {
+        selection
+            .selected
+            .iter()
+            .map(|item| {
+                render_selected_input_line(
+                    item,
+                    selection.retained_thread_ids.contains(&item.thread_id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let removed = if selection.removed.is_empty() {
+        "- none".to_string()
+    } else {
+        selection
+            .removed
+            .iter()
+            .map(render_removed_input_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "- selected inputs this run: {}\n- newly added since the last successful Phase 2 run: {added}\n- retained from the last successful Phase 2 run: {retained}\n- removed from the last successful Phase 2 run: {}\n\nCurrent selected Phase 1 inputs:\n{selected}\n\nRemoved from the last successful Phase 2 selection:\n{removed}\n",
+        selection.selected.len(),
+        selection.removed.len(),
+    )
+}
+
+fn render_selected_input_line(item: &Stage1Output, retained: bool) -> String {
+    let status = if retained { "retained" } else { "added" };
+    let rollout_summary_file = format!(
+        "rollout_summaries/{}.md",
+        rollout_summary_file_stem_from_parts(
+            item.thread_id,
+            item.source_updated_at,
+            item.rollout_slug.as_deref(),
+        )
+    );
+    format!(
+        "- [{status}] thread_id={}, rollout_summary_file={rollout_summary_file}",
+        item.thread_id
+    )
+}
+
+fn render_removed_input_line(item: &Stage1OutputRef) -> String {
+    let rollout_summary_file = format!(
+        "rollout_summaries/{}.md",
+        rollout_summary_file_stem_from_parts(
+            item.thread_id,
+            item.source_updated_at,
+            item.rollout_slug.as_deref(),
+        )
+    );
+    format!(
+        "- thread_id={}, rollout_summary_file={rollout_summary_file}",
+        item.thread_id
+    )
 }
 
 /// Builds the stage-1 user message containing rollout metadata and content.
@@ -40,10 +150,11 @@ pub(super) fn build_stage_one_input_message(
 
     let rollout_path = rollout_path.display().to_string();
     let rollout_cwd = rollout_cwd.display().to_string();
-    Ok(STAGE_ONE_INPUT_TEMPLATE
-        .replace("{{ rollout_path }}", &rollout_path)
-        .replace("{{ rollout_cwd }}", &rollout_cwd)
-        .replace("{{ rollout_contents }}", &truncated_rollout_contents))
+    Ok(STAGE_ONE_INPUT_TEMPLATE.render([
+        ("rollout_path", rollout_path.as_str()),
+        ("rollout_cwd", rollout_cwd.as_str()),
+        ("rollout_contents", truncated_rollout_contents.as_str()),
+    ])?)
 }
 
 /// Build prompt used for read path. This prompt must be added to the developer instructions. In
@@ -65,64 +176,14 @@ pub(crate) async fn build_memory_tool_developer_instructions(codex_home: &Path) 
         return None;
     }
     let base_path = base_path.display().to_string();
-    Some(
-        READ_PATH_TEMPLATE
-            .replace("{{ base_path }}", &base_path)
-            .replace("{{ memory_summary }}", &memory_summary),
-    )
+    MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TEMPLATE
+        .render([
+            ("base_path", base_path.as_str()),
+            ("memory_summary", memory_summary.as_str()),
+        ])
+        .ok()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models_manager::model_info::model_info_from_slug;
-
-    #[test]
-    fn build_stage_one_input_message_truncates_rollout_using_model_context_window() {
-        let input = format!("{}{}{}", "a".repeat(700_000), "middle", "z".repeat(700_000));
-        let mut model_info = model_info_from_slug("gpt-5.2-codex");
-        model_info.context_window = Some(123_000);
-        let expected_rollout_token_limit = usize::try_from(
-            ((123_000_i64 * model_info.effective_context_window_percent) / 100)
-                * phase_one::CONTEXT_WINDOW_PERCENT
-                / 100,
-        )
-        .unwrap();
-        let expected_truncated = truncate_text(
-            &input,
-            TruncationPolicy::Tokens(expected_rollout_token_limit),
-        );
-        let message = build_stage_one_input_message(
-            &model_info,
-            Path::new("/tmp/rollout.jsonl"),
-            Path::new("/tmp"),
-            &input,
-        )
-        .unwrap();
-
-        assert!(expected_truncated.contains("tokens truncated"));
-        assert!(expected_truncated.starts_with('a'));
-        assert!(expected_truncated.ends_with('z'));
-        assert!(message.contains(&expected_truncated));
-    }
-
-    #[test]
-    fn build_stage_one_input_message_uses_default_limit_when_model_context_window_missing() {
-        let input = format!("{}{}{}", "a".repeat(700_000), "middle", "z".repeat(700_000));
-        let mut model_info = model_info_from_slug("gpt-5.2-codex");
-        model_info.context_window = None;
-        let expected_truncated = truncate_text(
-            &input,
-            TruncationPolicy::Tokens(phase_one::DEFAULT_STAGE_ONE_ROLLOUT_TOKEN_LIMIT),
-        );
-        let message = build_stage_one_input_message(
-            &model_info,
-            Path::new("/tmp/rollout.jsonl"),
-            Path::new("/tmp"),
-            &input,
-        )
-        .unwrap();
-
-        assert!(message.contains(&expected_truncated));
-    }
-}
+#[path = "prompts_tests.rs"]
+mod tests;

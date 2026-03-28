@@ -23,7 +23,7 @@ use crate::app::AttemptView;
 use crate::util::format_relative_time_now;
 use codex_cloud_tasks_client::AttemptStatus;
 use codex_cloud_tasks_client::TaskStatus;
-use codex_tui::render_markdown_text;
+use codex_tui_app_server::render_markdown_text;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -582,7 +582,10 @@ fn style_conversation_lines(
             speaker = Some(ConversationSpeaker::User);
             in_code = false;
             bullet_indent = None;
-            styled.push(conversation_header_line(ConversationSpeaker::User, None));
+            styled.push(conversation_header_line(
+                ConversationSpeaker::User,
+                /*attempt*/ None,
+            ));
             last_src = Some(src_idx);
             continue;
         }

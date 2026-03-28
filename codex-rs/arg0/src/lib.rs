@@ -4,29 +4,49 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
+use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_utils_home_dir::find_codex_home;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 use tempfile::TempDir;
 
-const LINUX_SANDBOX_ARG0: &str = "codex-linux-sandbox";
 const APPLY_PATCH_ARG0: &str = "apply_patch";
 const MISSPELLED_APPLY_PATCH_ARG0: &str = "applypatch";
+#[cfg(unix)]
+const EXECVE_WRAPPER_ARG0: &str = "codex-execve-wrapper";
 const LOCK_FILENAME: &str = ".lock";
 const TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Arg0DispatchPaths {
+    /// Stable path to the current Codex executable for child re-execs.
+    ///
+    /// Prefer this over [`std::env::current_exe()`] in code that may run under
+    /// a test harness, where `current_exe()` can point at the harness binary
+    /// instead of the real Codex CLI.
+    pub codex_self_exe: Option<PathBuf>,
+    pub codex_linux_sandbox_exe: Option<PathBuf>,
+    pub main_execve_wrapper_exe: Option<PathBuf>,
+}
 
 /// Keeps the per-session PATH entry alive and locked for the process lifetime.
 pub struct Arg0PathEntryGuard {
     _temp_dir: TempDir,
     _lock_file: File,
+    paths: Arg0DispatchPaths,
 }
 
 impl Arg0PathEntryGuard {
-    fn new(temp_dir: TempDir, lock_file: File) -> Self {
+    fn new(temp_dir: TempDir, lock_file: File, paths: Arg0DispatchPaths) -> Self {
         Self {
             _temp_dir: temp_dir,
             _lock_file: lock_file,
+            paths,
         }
+    }
+
+    pub fn paths(&self) -> &Arg0DispatchPaths {
+        &self.paths
     }
 }
 
@@ -39,7 +59,33 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    if exe_name == LINUX_SANDBOX_ARG0 {
+    #[cfg(unix)]
+    if exe_name == EXECVE_WRAPPER_ARG0 {
+        let mut args = std::env::args();
+        let _ = args.next();
+        let file = match args.next() {
+            Some(file) => file,
+            None => std::process::exit(1),
+        };
+        let argv = args.collect::<Vec<_>>();
+
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => std::process::exit(1),
+        };
+        let exit_code = runtime.block_on(
+            codex_shell_escalation::run_shell_escalation_execve_wrapper(file, argv),
+        );
+        match exit_code {
+            Ok(exit_code) => std::process::exit(exit_code),
+            Err(_) => std::process::exit(1),
+        }
+    }
+
+    if exe_name == CODEX_LINUX_SANDBOX_ARG0 {
         // Safety: [`run_main`] never returns.
         codex_linux_sandbox::run_main();
     } else if exe_name == APPLY_PATCH_ARG0 || exe_name == MISSPELLED_APPLY_PATCH_ARG0 {
@@ -93,37 +139,58 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
 ///
 /// 1.  Load `.env` values from `~/.codex/.env` before creating any threads.
 /// 2.  Construct a Tokio multi-thread runtime.
-/// 3.  Derive the path to the current executable (so children can re-invoke the
-///     sandbox) when running on Linux.
+/// 3.  Capture the current executable path and derive the
+///     `codex-linux-sandbox` helper path (falling back to the current
+///     executable if needed) so children can re-invoke the sandbox when running
+///     on Linux.
 /// 4.  Execute the provided async `main_fn` inside that runtime, forwarding any
-///     error. Note that `main_fn` receives `codex_linux_sandbox_exe:
-///     Option<PathBuf>`, as an argument, which is generally needed as part of
-///     constructing [`codex_core::config::Config`].
+///     error. Note that `main_fn` receives [`Arg0DispatchPaths`], which
+///     contains the helper executable paths needed to construct
+///     [`codex_core::config::Config`].
 ///
 /// This function should be used to wrap any `main()` function in binary crates
 /// in this workspace that depends on these helper CLIs.
 pub fn arg0_dispatch_or_else<F, Fut>(main_fn: F) -> anyhow::Result<()>
 where
-    F: FnOnce(Option<PathBuf>) -> Fut,
+    F: FnOnce(Arg0DispatchPaths) -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
     // Retain the TempDir so it exists for the lifetime of the invocation of
     // this executable. Admittedly, we could invoke `keep()` on it, but it
     // would be nice to avoid leaving temporary directories behind, if possible.
-    let _path_entry = arg0_dispatch();
+    let path_entry_guard = arg0_dispatch();
 
     // Regular invocation – create a Tokio runtime and execute the provided
     // async entry-point.
     let runtime = build_runtime()?;
     runtime.block_on(async move {
-        let codex_linux_sandbox_exe: Option<PathBuf> = if cfg!(target_os = "linux") {
-            std::env::current_exe().ok()
-        } else {
-            None
+        let current_exe = std::env::current_exe().ok();
+        let paths = Arg0DispatchPaths {
+            codex_self_exe: current_exe.clone(),
+            codex_linux_sandbox_exe: if cfg!(target_os = "linux") {
+                linux_sandbox_exe_path(path_entry_guard.as_ref(), current_exe)
+            } else {
+                None
+            },
+            main_execve_wrapper_exe: path_entry_guard
+                .as_ref()
+                .and_then(|path_entry| path_entry.paths().main_execve_wrapper_exe.clone()),
         };
 
-        main_fn(codex_linux_sandbox_exe).await
+        main_fn(paths).await
     })
+}
+
+fn linux_sandbox_exe_path(
+    path_entry_guard: Option<&Arg0PathEntryGuard>,
+    current_exe: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // Prefer the `codex-linux-sandbox` alias when available so callers can
+    // re-exec through a path whose basename still triggers arg0 dispatch on
+    // bubblewrap builds that do not support `--argv0`.
+    path_entry_guard
+        .and_then(|path_entry| path_entry.paths().codex_linux_sandbox_exe.clone())
+        .or(current_exe)
 }
 
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -226,7 +293,9 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
         APPLY_PATCH_ARG0,
         MISSPELLED_APPLY_PATCH_ARG0,
         #[cfg(target_os = "linux")]
-        LINUX_SANDBOX_ARG0,
+        CODEX_LINUX_SANDBOX_ARG0,
+        #[cfg(unix)]
+        EXECVE_WRAPPER_ARG0,
     ] {
         let exe = std::env::current_exe()?;
 
@@ -257,21 +326,47 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
     #[cfg(windows)]
     const PATH_SEPARATOR: &str = ";";
 
-    let path_element = path.display();
-    let updated_path_env_var = match std::env::var("PATH") {
-        Ok(existing_path) => {
-            format!("{path_element}{PATH_SEPARATOR}{existing_path}")
+    let updated_path_env_var = match std::env::var_os("PATH") {
+        Some(existing_path) => {
+            let mut path_env_var =
+                std::ffi::OsString::with_capacity(path.as_os_str().len() + 1 + existing_path.len());
+            path_env_var.push(path);
+            path_env_var.push(PATH_SEPARATOR);
+            path_env_var.push(existing_path);
+            path_env_var
         }
-        Err(_) => {
-            format!("{path_element}")
-        }
+        None => path.as_os_str().to_owned(),
     };
 
     unsafe {
         std::env::set_var("PATH", updated_path_env_var);
     }
 
-    Ok(Arg0PathEntryGuard::new(temp_dir, lock_file))
+    let paths = Arg0DispatchPaths {
+        codex_self_exe: std::env::current_exe().ok(),
+        codex_linux_sandbox_exe: {
+            #[cfg(target_os = "linux")]
+            {
+                Some(path.join(CODEX_LINUX_SANDBOX_ARG0))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        },
+        main_execve_wrapper_exe: {
+            #[cfg(unix)]
+            {
+                Some(path.join(EXECVE_WRAPPER_ARG0))
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        },
+    };
+
+    Ok(Arg0PathEntryGuard::new(temp_dir, lock_file, paths))
 }
 
 fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
@@ -320,11 +415,16 @@ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
 
 #[cfg(test)]
 mod tests {
+    use super::Arg0DispatchPaths;
+    use super::Arg0PathEntryGuard;
     use super::LOCK_FILENAME;
     use super::janitor_cleanup;
+    use super::linux_sandbox_exe_path;
     use std::fs;
     use std::fs::File;
     use std::path::Path;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn create_lock(dir: &Path) -> std::io::Result<File> {
         let lock_path = dir.join(LOCK_FILENAME);
@@ -334,6 +434,28 @@ mod tests {
             .create(true)
             .truncate(false)
             .open(lock_path)
+    }
+
+    #[test]
+    fn linux_sandbox_exe_path_prefers_codex_linux_sandbox_alias() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lock_file = create_lock(temp_dir.path())?;
+        let alias_path = temp_dir.path().join("codex-linux-sandbox");
+        let path_entry = Arg0PathEntryGuard::new(
+            temp_dir,
+            lock_file,
+            Arg0DispatchPaths {
+                codex_self_exe: Some(PathBuf::from("/usr/bin/codex")),
+                codex_linux_sandbox_exe: Some(alias_path.clone()),
+                main_execve_wrapper_exe: None,
+            },
+        );
+
+        assert_eq!(
+            linux_sandbox_exe_path(Some(&path_entry), Some(PathBuf::from("/usr/bin/codex"))),
+            Some(alias_path),
+        );
+        Ok(())
     }
 
     #[test]

@@ -4,8 +4,13 @@ mod firewall;
 
 use anyhow::Context;
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use codex_windows_sandbox::LOG_FILE_NAME;
+use codex_windows_sandbox::SETUP_VERSION;
+use codex_windows_sandbox::SetupErrorCode;
+use codex_windows_sandbox::SetupErrorReport;
+use codex_windows_sandbox::SetupFailure;
 use codex_windows_sandbox::canonicalize_path;
 use codex_windows_sandbox::convert_string_sid_to_sid;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
@@ -18,22 +23,18 @@ use codex_windows_sandbox::log_note;
 use codex_windows_sandbox::path_mask_allows;
 use codex_windows_sandbox::protect_workspace_agents_dir;
 use codex_windows_sandbox::protect_workspace_codex_dir;
+use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
 use codex_windows_sandbox::string_from_sid_bytes;
 use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::workspace_cap_sid_for_cwd;
 use codex_windows_sandbox::write_setup_error_report;
-use codex_windows_sandbox::SetupErrorCode;
-use codex_windows_sandbox::SetupErrorReport;
-use codex_windows_sandbox::SetupFailure;
-use codex_windows_sandbox::LOG_FILE_NAME;
-use codex_windows_sandbox::SETUP_VERSION;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::ffi::c_void;
 use std::ffi::OsStr;
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
@@ -43,17 +44,17 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::GetLastError;
-use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
-use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
-use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
+use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
-use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::CONTAINER_INHERIT_ACE;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
@@ -83,6 +84,10 @@ struct Payload {
     command_cwd: PathBuf,
     read_roots: Vec<PathBuf>,
     write_roots: Vec<PathBuf>,
+    #[serde(default)]
+    proxy_ports: Vec<u16>,
+    #[serde(default)]
+    allow_local_binding: bool,
     real_user: String,
     #[serde(default)]
     mode: SetupMode,
@@ -152,7 +157,7 @@ fn apply_read_acls(
         let builtin_has = read_mask_allows_or_log(
             root,
             subjects.rx_psids,
-            None,
+            /*label*/ None,
             access_mask,
             access_label,
             refresh_errors,
@@ -214,7 +219,7 @@ fn read_mask_allows_or_log(
     refresh_errors: &mut Vec<String>,
     log: &mut File,
 ) -> Result<bool> {
-    match path_mask_allows(root, psids, read_mask, true) {
+    match path_mask_allows(root, psids, read_mask, /*require_all_bits*/ true) {
         Ok(has) => Ok(has),
         Err(e) => {
             let label_suffix = label
@@ -245,6 +250,8 @@ fn lock_sandbox_dir(
     real_user: &str,
     sandbox_group_sid: &[u8],
     sandbox_group_access_mode: i32,
+    sandbox_group_mask: u32,
+    real_user_mask: u32,
     _log: &mut File,
 ) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -254,7 +261,7 @@ fn lock_sandbox_dir(
     let entries = [
         (
             sandbox_group_sid.to_vec(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+            sandbox_group_mask,
             sandbox_group_access_mode,
         ),
         (
@@ -267,11 +274,7 @@ fn lock_sandbox_dir(
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
             GRANT_ACCESS,
         ),
-        (
-            real_sid,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-            GRANT_ACCESS,
-        ),
+        (real_sid, real_user_mask, GRANT_ACCESS),
     ];
     unsafe {
         let mut eas: Vec<EXPLICIT_ACCESS_W> = Vec::new();
@@ -511,6 +514,8 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             &payload.codex_home,
             &payload.offline_username,
             &payload.online_username,
+            &payload.proxy_ports,
+            payload.allow_local_binding,
             log,
         );
         if let Err(err) = provision_result {
@@ -573,6 +578,21 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
     };
     let mut refresh_errors: Vec<String> = Vec::new();
     if !refresh_only {
+        let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
+            &offline_sid_str,
+            &payload.proxy_ports,
+            payload.allow_local_binding,
+            log,
+        );
+        if let Err(err) = proxy_allowlist_result {
+            if extract_setup_failure(&err).is_some() {
+                return Err(err);
+            }
+            return Err(anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+                format!("ensure offline proxy allowlist failed: {err}"),
+            )));
+        }
         let firewall_result = firewall::ensure_offline_outbound_block(&offline_sid_str, log);
         if let Err(err) = firewall_result {
             if extract_setup_failure(&err).is_some() {
@@ -654,25 +674,26 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             ("sandbox_group", sandbox_group_psid),
             (cap_label, cap_psid_for_root),
         ] {
-            let has = match path_mask_allows(root, &[psid], write_mask, true) {
-                Ok(h) => h,
-                Err(e) => {
-                    refresh_errors.push(format!(
-                        "write mask check failed on {} for {label}: {}",
-                        root.display(),
-                        e
-                    ));
-                    log_line(
-                        log,
-                        &format!(
-                            "write mask check failed on {} for {label}: {}; continuing",
+            let has =
+                match path_mask_allows(root, &[psid], write_mask, /*require_all_bits*/ true) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        refresh_errors.push(format!(
+                            "write mask check failed on {} for {label}: {}",
                             root.display(),
                             e
-                        ),
-                    )?;
-                    false
-                }
-            };
+                        ));
+                        log_line(
+                            log,
+                            &format!(
+                                "write mask check failed on {} for {label}: {}; continuing",
+                                root.display(),
+                                e
+                            ),
+                        )?;
+                        false
+                    }
+                };
             if !has {
                 need_grant = true;
             }
@@ -740,6 +761,25 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         }
     });
 
+    lock_sandbox_dir(
+        &sandbox_bin_dir(&payload.codex_home),
+        &payload.real_user,
+        &sandbox_group_sid,
+        GRANT_ACCESS,
+        FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+        log,
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperSandboxLockFailed,
+            format!(
+                "lock sandbox bin dir {} failed: {err}",
+                sandbox_bin_dir(&payload.codex_home).display()
+            ),
+        ))
+    })?;
+
     if refresh_only {
         log_line(
             log,
@@ -756,6 +796,8 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             &payload.real_user,
             &sandbox_group_sid,
             GRANT_ACCESS,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
             log,
         )
         .map_err(|err| {
@@ -772,6 +814,8 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             &payload.real_user,
             &sandbox_group_sid,
             DENY_ACCESS,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
             log,
         )
         .map_err(|err| {

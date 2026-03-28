@@ -14,6 +14,11 @@ codex *args:
 exec *args:
     cargo run --bin codex -- exec "$@"
 
+# Start codex-exec-server and run codex-tui.
+[no-cd]
+tui-with-exec-server *args:
+    ./scripts/run_tui_with_exec_server.sh "$@"
+
 # Run the CLI version of the file-search crate.
 file-search *args:
     cargo run --bin codex-file-search -- "$@"
@@ -30,7 +35,7 @@ fmt:
 fix *args:
     cargo clippy --fix --tests --allow-dirty "$@"
 
-clippy:
+clippy *args:
     cargo clippy --tests "$@"
 
 install:
@@ -64,6 +69,9 @@ bazel-lock-check:
 bazel-test:
     bazel test //... --keep_going
 
+bazel-clippy:
+    bazel build --config=clippy -- //codex-rs/... -//codex-rs/v8-poc:all
+
 bazel-remote-test:
     bazel test //... --config=remote --platforms=//:rbe --keep_going
 
@@ -81,6 +89,19 @@ write-config-schema:
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:
     cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- "$@"
+
+[no-cd]
+write-hooks-schema:
+    cargo run --manifest-path ./codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
+
+# Run the argument-comment Dylint checks across codex-rs.
+[no-cd]
+argument-comment-lint *args:
+    ./tools/argument-comment-lint/run-prebuilt-linter.py "$@"
+
+[no-cd]
+argument-comment-lint-from-source *args:
+    ./tools/argument-comment-lint/run.py "$@"
 
 # Tail logs from the state SQLite database
 log *args:

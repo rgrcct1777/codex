@@ -5,11 +5,11 @@ for Windows terminals.
 
 Primary implementations:
 
-- `codex-rs/tui/src/bottom_pane/chat_composer.rs`
+- `codex-rs/tui_app_server/src/bottom_pane/chat_composer.rs`
 
 Paste-burst detector:
 
-- `codex-rs/tui/src/bottom_pane/paste_burst.rs`
+- `codex-rs/tui_app_server/src/bottom_pane/paste_burst.rs`
 
 ## What problem is being solved?
 
@@ -68,7 +68,7 @@ while still providing a richer recall experience for in-session edits.
 ## Config gating for reuse
 
 `ChatComposer` now supports feature gating via `ChatComposerConfig`
-(`codex-rs/tui/src/bottom_pane/chat_composer.rs`). The default config preserves current chat
+(`codex-rs/tui_app_server/src/bottom_pane/chat_composer.rs`). The default config preserves current chat
 behavior.
 
 Flags:
@@ -90,7 +90,7 @@ Key effects when disabled:
   dropping the draft.
 
 Built-in slash command availability is centralized in
-`codex-rs/tui/src/bottom_pane/slash_commands.rs` and reused by both the composer and the command
+`codex-rs/tui_app_server/src/bottom_pane/slash_commands.rs` and reused by both the composer and the command
 popup so gating stays in sync.
 
 ## Submission flow (Enter/Tab)
@@ -117,6 +117,12 @@ the input starts with `!` (shell command).
 
 The same preparation path is reused for slash commands with arguments (for example `/plan` and
 `/review`) so pasted content and text elements are preserved when extracting args.
+
+The composer also treats the textarea kill buffer as separate editing state from the visible draft.
+After submit or slash-command dispatch clears the textarea, the most recent `Ctrl+K` payload is
+still available for `Ctrl+Y`. This supports flows where a user kills part of a draft, runs a
+composer action such as changing reasoning level, and then yanks that text back into the cleared
+draft.
 
 ### Numeric auto-submit path
 
@@ -339,7 +345,7 @@ Non-char input must not leak burst state across unrelated actions:
 
 The `PasteBurst` logic is currently exercised through `ChatComposer` integration tests.
 
-- `codex-rs/tui/src/bottom_pane/chat_composer.rs`
+- `codex-rs/tui_app_server/src/bottom_pane/chat_composer.rs`
   - `non_ascii_burst_handles_newline`
   - `ascii_burst_treats_enter_as_newline`
   - `question_mark_does_not_toggle_during_paste_burst`
